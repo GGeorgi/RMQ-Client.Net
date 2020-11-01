@@ -25,13 +25,6 @@ public void ConfigureServices(IServiceCollection services)
 ```c#
 public class EventsHandlerService : IEventsHandlerService
 {
-    private readonly IServiceProvider _serviceProvider;
-
-    public EventsHandlerService(IServiceProvider serviceProvider)
-    {
-        _serviceProvider = serviceProvider;
-    }
-
     public async Task<dynamic> Handle(Message e)
     {
         var code = e.Code;
