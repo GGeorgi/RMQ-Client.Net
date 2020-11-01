@@ -1,5 +1,5 @@
-1. RPClient need only to send request and get response for that request.
-2. RPCServer needs for accepting requests.
+1. RPClient required only for sending request and getting request's response.
+2. RPCServer required only for accepting requests.
 
 ## Usage
 
