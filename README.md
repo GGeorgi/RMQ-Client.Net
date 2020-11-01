@@ -79,3 +79,18 @@ class SomeClass
     }
 }
 ```
+
+#### appsettings.json
+
+```json
+{
+    "RabbitMQ": {
+        "Host": "localhost",
+        "Username": "username",
+        "Password": "password",
+        "Vhost": "hostname",
+        "Queue": "service_queue_name",
+        "Port": 5672
+    }
+}
+```
