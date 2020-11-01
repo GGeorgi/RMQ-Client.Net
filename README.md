@@ -1,5 +1,5 @@
-1. RPClient need only to send request and get response for that request.
-2. RPCServer needs for accepting requests.
+1. RPClient required only for sending request and getting request's response.
+2. RPCServer required only for accepting requests.
 
 ## Usage
 
@@ -46,6 +46,36 @@ public class EventsHandlerService : IEventsHandlerService
         }
 
         return null;
+    }
+}
+```
+
+#### Request/Response Example
+
+```c#
+class Response
+{
+    public bool Done { get; set; }
+}
+
+...
+
+class SomeClass
+{
+    public Constructor(RPCClient client)
+    {
+        _client = client;
+    }
+    
+    ...
+
+    public async Task SomeRequest()
+    {
+        await _client.CallAsync("service_queue_name", 1, new {Id = 1, Name = "Test"});
+        
+        var result = await _client.CallAsync<Response>("service_queue_name", 2, new {Id = 1, Name = "Test"});
+        
+        Console.WriteLine(result.Done)
     }
 }
 ```
