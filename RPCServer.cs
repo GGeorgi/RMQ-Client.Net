@@ -1,4 +1,7 @@
 ﻿using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Linq;
 using Microsoft.Extensions.Configuration;
 using Newtonsoft.Json;
 using RabbitMQ.Client;
@@ -6,54 +9,68 @@ using RabbitMQ.Client.Events;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using RMQClient.Net.Handlers;
 using Microsoft.Extensions.Hosting;
+using EventHandler = RMQClient.Net.Handlers.EventHandler;
 
 namespace RMQClient.Net
 {
     public sealed class RPCServer : IHostedService
     {
-        private const string exchange = "rmqclient-updates";
-        private readonly string queue;
-        private readonly string queueExceptions;
-        private IModel _channel;
-        private readonly IEventsHandlerService handler;
-        private readonly int[] _events;
-        private readonly ConnectionFactory _factory;
-        private IConnection _connection;
+        private readonly IEnumerable<EventHandler> _handlers;
+        private readonly RequestHandler? _requestHandler;
+        private const string EXCHANGE = "updates";
+        private readonly string _queue;
+        private readonly string _queueExceptions;
+        private readonly IModel _channel;
+        private readonly IConnection _connection;
+        private readonly ushort _count;
+        private readonly List<IConvertible> _events;
 
-        public RPCServer(IConfiguration config, IEventsHandlerService handler, int[] events = null)
+        public RPCServer(
+            IConfiguration config,
+            IEnumerable<EventHandler> handlers,
+            RequestHandler requestHandler = null!)
         {
-            this.handler = handler;
-            queue = config.GetValue<string>("RabbitMQ:Queue");
-            queueExceptions = $"{queue}Exceptions";
-            _events = events;
-            _factory = new ConnectionFactory
+            _handlers = handlers;
+            _requestHandler = requestHandler;
+            _queue = config.GetValue<string>("RabbitMQ:Queue");
+            _queueExceptions = $"{_queue}Exceptions";
+
+            ConnectionFactory factory = new()
             {
                 HostName = config.GetValue<string>("RabbitMQ:Host"),
                 UserName = config.GetValue<string>("RabbitMQ:Username"),
                 Password = config.GetValue<string>("RabbitMQ:Password"),
                 Port = config.GetValue<int>("RabbitMQ:Port"),
                 VirtualHost = config.GetValue<string>("RabbitMQ:Vhost"),
-                AutomaticRecoveryEnabled = true
+                AutomaticRecoveryEnabled = true,
             };
+            _count = config.GetValue<ushort?>("RabbitMQ:Prefetch") ?? 100;
+
+            _events = _handlers.SelectMany(x => x.Codes).ToList();
+            if (_requestHandler != null)
+            {
+                _events.AddRange(_requestHandler.Codes);
+            }
+
+            _connection = factory.CreateConnection();
+            _channel = _connection.CreateModel();
         }
 
 
-        private void Subscribe(int[] events)
+        private void Subscribe(IEnumerable<IConvertible> events)
         {
-            _channel.ExchangeDeclare(exchange, ExchangeType.Direct);
-            _channel.QueueDeclare(queue, false, false, false, null);
-            _channel.QueueDeclare(queueExceptions, false, false, false, null);
-            if (events != null)
+            _channel.ExchangeDeclare(EXCHANGE, ExchangeType.Direct);
+            _channel.QueueDeclare(_queue, false, false, false, null);
+            _channel.QueueDeclare(_queueExceptions, false, false, false, null);
+            foreach (var item in events)
             {
-                foreach (var item in events)
-                {
-                    _channel.QueueBind(queue, exchange, item.ToString());
-                }
+                _channel.QueueBind(_queue, EXCHANGE, item.ToString(CultureInfo.InvariantCulture));
             }
 
             var consumer = new EventingBasicConsumer(_channel);
-            consumer.Received += async (model, ea) =>
+            consumer.Received += async (_, ea) =>
             {
                 var body = ea.Body;
                 var message = Encoding.UTF8.GetString(body);
@@ -61,59 +78,74 @@ namespace RMQClient.Net
                 var props = ea.BasicProperties;
                 var replyProps = _channel.CreateBasicProperties();
                 replyProps.CorrelationId = props.CorrelationId;
-                try
-                {
-                    var response = await handler.Handle(deserializedMessage);
-                    if (props.CorrelationId != null && props.ReplyTo != null)
-                    {
-                        var messageData = new Message
-                        {
-                            Body = response,
-                            Code = deserializedMessage.Code
-                        };
-                        var replyMessage = JsonConvert.SerializeObject(messageData);
-                        var replyMessageBytes = Encoding.UTF8.GetBytes(replyMessage);
 
-                        _channel.BasicPublish("", props.ReplyTo, replyProps, replyMessageBytes);
+                #region notify subscribers
+
+                foreach (var eventHandler in _handlers)
+                {
+                    eventHandler.Notify(deserializedMessage.Code, deserializedMessage);
+                }
+
+                #endregion
+
+                #region Send Response
+
+                if (_requestHandler != null)
+                {
+                    try
+                    {
+                        var response = await _requestHandler.Handle(deserializedMessage.Code, deserializedMessage);
+                        if (response != null && props.CorrelationId != null && props.ReplyTo != null)
+                        {
+                            var messageData = new Message
+                            {
+                                Body = response!,
+                                Code = deserializedMessage.Code
+                            };
+                            var replyMessage = JsonConvert.SerializeObject(messageData);
+                            var replyMessageBytes = Encoding.UTF8.GetBytes(replyMessage);
+
+                            _channel.BasicPublish("", props.ReplyTo, replyProps, replyMessageBytes);
+                        }
+                    }
+                    catch (Exception e)
+                    {
+                        if (props.CorrelationId != null && props.ReplyTo != null)
+                        {
+                            var errorReply = JsonConvert.SerializeObject(new Message
+                            {
+                                Body = e.Message,
+                                Code = deserializedMessage.Code,
+                                Error = true
+                            });
+                            var errorReplyBytes = Encoding.UTF8.GetBytes(errorReply);
+
+                            _channel.BasicPublish("", props.ReplyTo, replyProps, errorReplyBytes);
+                        }
+                        else
+                        {
+                            var replyMessage = JsonConvert.SerializeObject(new Message
+                            {
+                                Body = e,
+                                Code = deserializedMessage.Code,
+                                Error = true
+                            });
+                            var replyMessageBytes = Encoding.UTF8.GetBytes(replyMessage);
+                            _channel.BasicPublish("", _queueExceptions, replyProps, replyMessageBytes);
+                        }
                     }
                 }
-                catch (Exception e)
-                {
-                    if (props.CorrelationId != null && props.ReplyTo != null)
-                    {
-                        var errorReply = JsonConvert.SerializeObject(new Message
-                        {
-                            Body = e.Message,
-                            Code = deserializedMessage.Code,
-                            Error = true
-                        });
-                        var errorReplyBytes = Encoding.UTF8.GetBytes(errorReply);
 
-                        _channel.BasicPublish("", props.ReplyTo, replyProps, errorReplyBytes);
-                    }
-                    else
-                    {
-                        var replyMessage = JsonConvert.SerializeObject(new Message
-                        {
-                            Body = e,
-                            Code = deserializedMessage.Code,
-                            Error = true
-                        });
-                        var replyMessageBytes = Encoding.UTF8.GetBytes(replyMessage);
-                        _channel.BasicPublish("", queueExceptions, replyProps, replyMessageBytes);
-                    }
-                }
+                #endregion
 
                 _channel.BasicAck(ea.DeliveryTag, false);
             };
-            _channel.BasicQos(0, 100, true);
-            _channel.BasicConsume(queue, false, consumer);
+            _channel.BasicQos(0, _count, true);
+            _channel.BasicConsume(_queue, false, consumer);
         }
 
         public Task StartAsync(CancellationToken cancellationToken)
         {
-            _connection = _factory.CreateConnection();
-            _channel = _connection.CreateModel();
             Subscribe(_events);
             return Task.CompletedTask;
         }
